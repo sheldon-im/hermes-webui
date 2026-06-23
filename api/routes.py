@@ -1575,6 +1575,14 @@ _SESSIONS_CACHE_TTL_SECONDS = 2.5
 _SESSIONS_CACHE_MAX_ENTRIES = 64
 _SESSIONS_CACHE_WAIT_SECONDS = 0.25
 _SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
+# Cold-miss join wait (#4718): when NO payload exists yet (the cold profile-switch
+# case) and a rebuild is genuinely in-flight — e.g. the post-switch pre-warm is
+# already building — a second caller (the client's sidebar GET) should JOIN that
+# build rather than give up after 0.25s and redundantly build it again. The real
+# cold build is ~0.8s, so a sub-second wait guarantees double work; this ceiling
+# lets the waiter ride the in-flight build to completion. Only used on a true cold
+# miss with a live in-flight owner (a stale payload is still served immediately).
+_SESSIONS_CACHE_COLD_JOIN_WAIT_SECONDS = 2.0
 _SESSIONS_CACHE: OrderedDict[tuple, tuple[float, tuple, dict]] = OrderedDict()
 _SESSIONS_CACHE_LOCK = threading.RLock()
 _SESSIONS_CACHE_INFLIGHT: dict[tuple, threading.Event] = {}
@@ -2283,7 +2291,19 @@ def _get_cached_session_list_payload(
     if stale is not None:
         timeout = _SESSIONS_CACHE_STALE_WAIT_SECONDS
     else:
-        timeout = _SESSIONS_CACHE_WAIT_SECONDS
+        # True cold miss. If a rebuild is genuinely in-flight (an owner is building —
+        # e.g. the post-switch pre-warm), JOIN it: wait long enough to ride that build
+        # to completion instead of giving up at 0.25s and redundantly rebuilding the
+        # same payload ourselves (the post-switch double-build, #4718). If no owner is
+        # in flight, keep the short wait — there's nothing to join, and the fast
+        # fall-through to our own build below is correct.
+        with _SESSIONS_CACHE_LOCK:
+            rebuild_in_flight = _SESSIONS_CACHE_INFLIGHT.get(key) is not None
+        timeout = (
+            _SESSIONS_CACHE_COLD_JOIN_WAIT_SECONDS
+            if rebuild_in_flight
+            else _SESSIONS_CACHE_WAIT_SECONDS
+        )
     event.wait(timeout)
 
     latest, is_fresh = _session_list_cache_get(key, allow_stale=False)
@@ -11887,21 +11907,29 @@ def handle_post(handler, parsed) -> bool:
             # Pre-warm the target profile's sidebar payload on a detached thread (#4718):
             # the switch POST returns in ~200ms but the client's /api/sessions GET then
             # pays the ~780ms cold build (measured by @rodboev). Warming the SAME cache
-            # the sidebar reads lets that GET hit a warm payload, dropping the perceived
-            # switch from ~1s to ~200ms. Best-effort + fully detached: never blocks/fails
-            # the switch response. profile_scope_for_detached_worker binds BOTH the
-            # request-profile TLS and env so the warm resolves the TARGET profile (not the
-            # process default) — get_active_profile_name() inside the build reads the TLS.
+            # the sidebar reads lets that GET join/hit a warm payload, dropping the
+            # perceived switch from ~1s to ~200ms. Best-effort + fully detached: never
+            # blocks/fails the switch response.
+            #
+            # Profile scoping: the sidebar build resolves its profile via
+            # get_active_profile_name() (thread-local, #798) for the WebUI-session filter
+            # AND via get_active_hermes_home() (also TLS-derived) for any CLI-session read
+            # — neither reads process os.environ. So binding ONLY the request-profile TLS
+            # on this worker thread is sufficient and correct; we deliberately do NOT use
+            # profile_scope_for_detached_worker here because its process-global os.environ
+            # mutation would open a cross-profile env-bleed window for the full ~780ms
+            # build on this multithreaded server (Opus gate). set/clear TLS is leak-free.
             try:
                 import threading as _threading
-                from api.profiles import profile_scope_for_detached_worker
+                from api.profiles import set_request_profile, clear_request_profile
 
                 def _warm_target_profile_sidebar(profile_name: str):
                     try:
-                        with profile_scope_for_detached_worker(
-                            profile_name, purpose="profile-switch sidebar pre-warm"
-                        ):
+                        set_request_profile(profile_name)
+                        try:
                             warm_session_list_cache(profile_name)
+                        finally:
+                            clear_request_profile()
                     except Exception as warm_exc:  # pragma: no cover - defensive
                         logger.debug("post-switch sidebar pre-warm skipped: %s", warm_exc)
 

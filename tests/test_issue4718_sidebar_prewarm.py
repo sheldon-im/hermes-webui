@@ -147,3 +147,61 @@ def test_warm_never_raises(monkeypatch):
 
     # Must not raise; returns False on failure.
     assert routes.warm_session_list_cache("work") is False
+
+
+def test_cold_miss_follower_joins_inflight_build_no_double_build():
+    """The post-switch effectiveness fix (#4718): on a true COLD miss (no cached or
+    stale payload) with a rebuild genuinely in-flight — e.g. the pre-warm is building —
+    a second caller (the client's sidebar GET) must JOIN that build and receive its
+    result, NOT give up after the old 0.25s wait and redundantly rebuild. Pins that the
+    cold-join wait closes the warm-vs-client double-build window.
+    """
+    routes._session_list_cache_clear()
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+    lock = threading.Lock()
+
+    def builder():
+        with lock:
+            calls["n"] += 1
+        started.set()
+        # Hold the build well past the OLD 0.25s follower wait to prove the follower
+        # now rides the in-flight build instead of timing out and double-building.
+        release.wait(timeout=5)
+        return {"sessions": [{"session_id": "joined"}], "active_profile": "work"}
+
+    key = routes._session_list_cache_key(
+        active_profile="work",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        exclude_hidden=True,
+        visible_only=True,
+        sidebar_source="webui",
+    )
+    results = []
+
+    def reader():
+        results.append(routes._get_cached_session_list_payload(key=key, builder=builder))
+
+    owner = threading.Thread(target=reader)
+    owner.start()
+    assert started.wait(2.0), "owner build never started"
+    # Follower arrives on a COLD key (no stale payload) while the build is in flight.
+    follower = threading.Thread(target=reader)
+    follower.start()
+    # Give the follower time to pass the OLD 0.25s ceiling; it should still be waiting
+    # (joining), not have fallen through to its own build.
+    time.sleep(0.5)
+    with lock:
+        assert calls["n"] == 1, "follower double-built instead of joining the in-flight build"
+    release.set()
+    owner.join(3)
+    follower.join(3)
+    assert len(results) == 2
+    assert results[0] == results[1] == {"sessions": [{"session_id": "joined"}], "active_profile": "work"}
+    assert calls["n"] == 1, "exactly one build should have run for the cold-join case"
+
