@@ -529,6 +529,11 @@ def test_scope_mismatch_error_path_respects_sidebar_source():
     requested_source_fn = _extract_function(src, "_requestedSessionSidebarSource")
     exclude_hidden_fn = _extract_function(src, "_sessionListExcludeHiddenEnabled")
     query_fn = _extract_function(src, "_sessionListQueryString")
+    fetch_helper_fn = _extract_function(src, "_loadSidebarSessionListPayload").replace(
+        "function _loadSidebarSessionListPayload",
+        "async function _loadSidebarSessionListPayload",
+        1,
+    )
     refresh_fn = _extract_function(src, "_runRenderSessionListRefresh").replace(
         "function _runRenderSessionListRefresh",
         "async function _runRenderSessionListRefresh",
@@ -574,6 +579,7 @@ global.api = () => Promise.reject(new Error('boom'));
     {requested_source_fn}
     {exclude_hidden_fn}
     {query_fn}
+    {fetch_helper_fn}
     {refresh_fn}
 async function runCase(requestedSource, cachedSource) {{
   global._sessionSourceFilter = requestedSource;

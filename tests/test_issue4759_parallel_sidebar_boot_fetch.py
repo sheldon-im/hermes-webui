@@ -257,3 +257,74 @@ global.api = (url, opts) => {{
     assert session_opts["retryTimeouts"] is True
     assert session_opts["retryStatuses"] == [502, 503, 504]
     assert project_opts == {"timeoutToast": False}
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_warm_refresh_parallelizes_projects_fetch_and_keeps_minimal_session_opts():
+    """Warm refresh uses minimal session opts, but still starts projects immediately."""
+    fetch_helper = _extract_function(SESSIONS_JS, "_loadSidebarSessionListPayload")
+    script = f"""
+const calls = [];
+let resolveSessions;
+let resolveProjects;
+global._showAllProfiles = false;
+global._allProjects = [];
+global._sessionListHasLoadedOnce = true;
+global.api = (url, opts) => {{
+  if (url.startsWith('/api/projects')) {{
+    calls.push({{ endpoint:'projects', opts: opts || null }});
+    return new Promise(resolve => {{
+      resolveProjects = resolve;
+    }});
+  }}
+  if (url.startsWith('/api/sessions')) {{
+    calls.push({{ endpoint:'sessions', opts: opts || null }});
+    return new Promise(resolve => {{
+      resolveSessions = resolve;
+    }});
+  }}
+  return Promise.reject(new Error('unexpected endpoint ' + url));
+}};
+{fetch_helper}
+
+(async () => {{
+  const run = _loadSidebarSessionListPayload('?v=1', {{
+    timeoutToast:false,
+    timeoutMs:90000,
+    retries:1,
+    retryTimeouts:true,
+    retryStatuses:[502,503,504],
+  }});
+
+  await Promise.resolve();
+  const orderAtSettleBoundary = calls.map(call => call.endpoint);
+  const sessionOpts = calls.find(call => call.endpoint === 'sessions').opts;
+  const projectOpts = calls.find(call => call.endpoint === 'projects').opts;
+
+  resolveSessions({{
+    sessions:[{{session_id:'warm-1'}}],
+    other_profile_count:0,
+    archived_count:0,
+    archived_webui_count:0,
+    archived_cli_count:0,
+  }});
+  resolveProjects({{projects:[{{name:'demo'}}]}});
+  const payload = await run;
+  console.log(JSON.stringify({{
+    orderAtSettleBoundary,
+    sessionOpts,
+    projectOpts,
+    payload,
+  }}));
+}})().catch(error => {{
+  console.error(error);
+  process.exit(1);
+}});
+"""
+
+    body = _run_node(script)
+    assert body["orderAtSettleBoundary"] == ["projects", "sessions"]
+    assert body["sessionOpts"] == {"timeoutToast": False}
+    assert body["projectOpts"] == {"timeoutToast": False}
+    assert body["payload"]["sessData"]["sessions"] == [{"session_id": "warm-1"}]
+    assert body["payload"]["projData"]["projects"] == [{"name": "demo"}]
