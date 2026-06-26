@@ -138,13 +138,13 @@ def _discover_agent_dir() -> Path:
       5. Common install paths            -- ~/.hermes/hermes-agent (again as fallback)
       6. HOME / hermes-agent             -- ~/hermes-agent (simple flat layout)
     """
-    candidates = []
+    explicit_override = os.getenv("HERMES_WEBUI_AGENT_DIR")
+    if explicit_override:
+        explicit_path = Path(explicit_override).expanduser().resolve()
+        if explicit_path.exists() and _looks_like_agent_source_root(explicit_path):
+            return explicit_path
 
-    # 1. Explicit env var
-    if os.getenv("HERMES_WEBUI_AGENT_DIR"):
-        candidates.append(
-            Path(os.getenv("HERMES_WEBUI_AGENT_DIR")).expanduser().resolve()
-        )
+    candidates = []
 
     # 2. HERMES_HOME / hermes-agent
     hermes_home = os.getenv("HERMES_HOME", str(_DEFAULT_HERMES_HOME))
@@ -154,7 +154,7 @@ def _discover_agent_dir() -> Path:
     candidates.append(REPO_ROOT.parent / "hermes-agent")
 
     # 4. Parent is the agent repo itself (repo cloned inside hermes-agent/)
-    if (REPO_ROOT.parent / "run_agent.py").exists():
+    if _looks_like_agent_source_root(REPO_ROOT.parent):
         candidates.append(REPO_ROOT.parent)
 
     # 5. ~/.hermes/hermes-agent (explicit common path)
@@ -171,11 +171,36 @@ def _discover_agent_dir() -> Path:
     for sys_prefix in ("/opt", "/usr/local", "/usr/local/share"):
         candidates.append(Path(sys_prefix) / "hermes-agent")
 
+    # Prefer real source checkouts before pip-style roots so lookalikes cannot preempt them.
     for path in candidates:
         if path.exists() and (path / "run_agent.py").exists():
             return path.resolve()
 
+    for path in candidates:
+        if path.exists() and _looks_like_pip_style_agent_source_root(path):
+            return path.resolve()
+
     return None
+
+
+def _looks_like_agent_source_root(path: Path) -> bool:
+    """Return True when a directory resembles a hermes-agent source root."""
+    if (path / "run_agent.py").exists():
+        return True
+    return _looks_like_pip_style_agent_source_root(path)
+
+
+def _looks_like_pip_style_agent_source_root(path: Path) -> bool:
+    """Return True for pip-style agent roots with a real agent package signal."""
+    if not (path / "cron" / "jobs.py").exists():
+        return False
+    if (path / "hermes").exists():
+        return True
+    hermes_cli_dir = path / "hermes_cli"
+    return (
+        (hermes_cli_dir / "__init__.py").exists()
+        or (hermes_cli_dir / "main.py").exists()
+    )
 
 
 def _discover_python(agent_dir: Path) -> str:
