@@ -9976,7 +9976,9 @@ function _applySavedSettingsUi(saved, body, opts){
   window._sessionJumpButtonsEnabled=!!body.session_jump_buttons;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   window._sidebarDensity=sidebarDensity==='detailed'?'detailed':'compact';
-  window._busyInputMode=body.busy_input_mode||'queue';
+  window._busyInputMode=(typeof _persistBusyInputMode==='function')
+    ? _persistBusyInputMode(body.busy_input_mode)
+    : (body.busy_input_mode||'queue');
   window._sessionEndlessScrollEnabled=!!body.session_endless_scroll;
   window._autoScrollFollow=body.auto_scroll_follow!==false;
   if(Object.prototype.hasOwnProperty.call(body,'structured_code_default_view')){
