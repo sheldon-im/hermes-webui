@@ -918,7 +918,7 @@ window._micPendingSend=window._micPendingSend||false;
 // ── Busy input mode eager default (#5167) ───────────────────────────────────
 // The Busy input mode preference (queue/interrupt/steer) is read on the send
 // path via `window._busyInputMode||'queue'`. The authoritative value only
-// arrives once the async boot IIFE below resolves `await api('/api/settings')`.
+// arrives once the async boot IIFE below resolves the `/api/settings` fetch.
 // Without an eager value, every send during that boot window silently falls
 // back to 'queue', ignoring a saved 'steer'/'interrupt' preference (worse on
 // slow/contended environments like WSL2, see #5132). Mirror the resolved value
