@@ -6322,9 +6322,31 @@ def _loose_session_message_content(value: str) -> str:
 def _session_message_content_key(msg: dict):
     if not isinstance(msg, dict):
         return ("non_dict", repr(msg))
+    role = str(msg.get("role") or "")
+    content = _normalized_session_message_content(msg)
+    if role == "user":
+        # WebUI sends the model a workspace-prefixed user_message
+        # ("[Workspace::v1: /path]\n<text>") while the visible/optimistic
+        # bubble and the WebUI sidecar row carry only the bare "<text>". The
+        # streaming dedup identity (_message_identity in api/streaming.py)
+        # strips this prefix for user turns, so this reconciliation key must
+        # do the same. Otherwise a state.db row (prefixed) and a sidecar row
+        # (bare) key DIFFERENTLY, the alignment loop in
+        # state_db_delta_after_context fails to match them, treats the
+        # state.db copy as a NEW row, and appends a duplicate user turn. The
+        # agent then merges the two adjacent user rows into a permanent
+        # composite -- the post-restart stale-user-prepend bug (#5339). Reuse
+        # the SAME helper as the streaming side (imported lazily to avoid a
+        # circular import; api.streaming imports api.models at module load) so
+        # the two dedup layers can't drift apart again.
+        from api.streaming import _strip_workspace_prefix
+
+        content = " ".join(
+            _strip_workspace_prefix(content, include_legacy=True).split()
+        )
     return (
-        str(msg.get("role") or ""),
-        _normalized_session_message_content(msg),
+        role,
+        content,
         str(msg.get("tool_call_id") or ""),
         str(msg.get("tool_name") or msg.get("name") or ""),
     )
