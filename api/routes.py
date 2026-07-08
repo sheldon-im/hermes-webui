@@ -8676,6 +8676,7 @@ from api.models import (
     PROCESS_WAKEUP_PAUSE_ERROR,
     clear_process_wakeup_pause,
     clear_process_wakeup_pause_if_model_changed,
+    process_wakeup_pause_matches,
     process_wakeup_pause_credential_state_changed,
     suppress_process_wakeup_for_provider_pause,
 )
@@ -8910,7 +8911,14 @@ from api.run_journal import (
     stale_interrupted_event,
 )
 from api.todo_state import attach_todo_state
-from api.providers import get_providers, get_provider_quota, get_provider_cost_history, set_provider_key, remove_provider_key
+from api.providers import (
+    get_providers,
+    get_provider_quota,
+    get_provider_cost_history,
+    provider_has_usable_credential,
+    set_provider_key,
+    remove_provider_key,
+)
 from api.onboarding import (
     apply_onboarding_setup,
     get_onboarding_status,
@@ -19916,6 +19924,34 @@ def start_session_turn(
                         session_id,
                         exc_info=True,
                     )
+        if process_wakeup_pause_matches(
+            s,
+            model=model,
+            provider=model_provider,
+            classification='credential_pool_empty',
+        ):
+            _credential_recovered = False
+            try:
+                _credential_recovered = provider_has_usable_credential(
+                    model_provider,
+                    refresh=True,
+                )
+            except Exception:
+                logger.debug(
+                    "failed to revalidate process_wakeup credential availability for session %s",
+                    session_id,
+                    exc_info=True,
+                )
+            if _credential_recovered:
+                if clear_process_wakeup_pause(s, reason='credential_recovered'):
+                    try:
+                        s.save(touch_updated_at=False)
+                    except Exception:
+                        logger.debug(
+                            "failed to persist process_wakeup credential recovery reset for session %s",
+                            session_id,
+                            exc_info=True,
+                        )
         _paused_wakeup = suppress_process_wakeup_for_provider_pause(
             s,
             model=model,

@@ -13,6 +13,8 @@ import pytest
 
 import api.config as config
 import api.models as models
+import api.profiles as profiles
+import api.providers as providers
 import api.routes as routes
 import api.streaming as streaming
 from api.models import PROCESS_WAKEUP_PAUSE_ERROR, Session
@@ -59,6 +61,11 @@ def _isolate_agent_locks():
     config.SESSION_AGENT_LOCKS.clear()
     yield
     config.SESSION_AGENT_LOCKS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _default_live_credential_revalidation(monkeypatch):
+    monkeypatch.setattr(routes, "provider_has_usable_credential", lambda *_args, **_kwargs: False)
 
 
 @pytest.fixture(autouse=True)
@@ -121,6 +128,41 @@ class _StaleCredentialPoolEmptyAgent(_MockAgent):
         session.pending_user_source = "webui"
         session.save(touch_updated_at=False)
         raise RuntimeError("All 0 credential(s) exhausted for test-provider")
+
+
+class _FakeCredentialPoolEntry:
+    def __init__(self, payload):
+        self._payload = dict(payload)
+        for key, value in self._payload.items():
+            setattr(self, key, value)
+        self.source = self._payload.get("source", "manual")
+        self.label = self._payload.get("label", "")
+        self.key_source = self._payload.get("key_source", "")
+
+    def to_dict(self):
+        return dict(self._payload)
+
+
+class _FakeCredentialPool:
+    def __init__(self, entries):
+        self._entries = list(entries)
+
+    def entries(self):
+        return list(self._entries)
+
+
+def _install_fake_agent_credential_pool(monkeypatch, pool_data):
+    fake_agent = types.ModuleType("agent")
+    fake_agent.__path__ = []
+    fake_pool_module = types.ModuleType("agent.credential_pool")
+
+    def _load_pool(provider_id):
+        entries = pool_data.get(provider_id, [])
+        return _FakeCredentialPool(_FakeCredentialPoolEntry(entry) for entry in entries)
+
+    fake_pool_module.load_pool = _load_pool
+    monkeypatch.setitem(sys.modules, "agent", fake_agent)
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", fake_pool_module)
 
 
 def _run_failing_process_wakeup(session: Session, tmp_path, *, stream_id=None):
@@ -406,6 +448,87 @@ def test_process_wakeup_pause_survives_rotation_style_auth_rewrite(tmp_path, mon
     assert saved is not None
     assert saved.process_wakeup_pause["suppressed_count"] == 1
     assert saved.process_wakeup_pause["credential_state_fingerprint"] == paused_fingerprint
+
+
+def test_process_wakeup_pause_revalidates_status_recovery_without_fingerprint_change(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    auth_json = hermes_home / "auth.json"
+    exhausted_entry = {
+        "id": "pooled-token",
+        "label": "Test provider credential",
+        "source": "manual",
+        "auth_type": "api_key",
+        "runtime_api_key": "sk-test-provider",
+        "last_status": "exhausted",
+        "last_status_at": "2026-07-07T00:00:00Z",
+        "last_error_code": "429",
+        "last_error_reset_at": "2999-01-01T00:00:00Z",
+    }
+    pool_data = {"test-provider": [dict(exhausted_entry)]}
+    auth_json.write_text(json.dumps({"credential_pool": pool_data}), encoding="utf-8")
+    _install_fake_agent_credential_pool(monkeypatch, pool_data)
+    monkeypatch.setattr(models, "_get_profile_home", lambda _profile: hermes_home)
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(routes, "provider_has_usable_credential", providers.provider_has_usable_credential)
+    session = Session(
+        session_id="wakeup_pause_status_recovery",
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+    )
+    pause = models.record_process_wakeup_provider_unavailable_pause(
+        session,
+        classification="credential_pool_empty",
+        model="test-model",
+        provider="test-provider",
+    )
+    assert pause is not None
+    paused_fingerprint = pause["credential_state_fingerprint"]
+    session.save()
+    models.SESSIONS[session.session_id] = session
+
+    recovered_entry = dict(exhausted_entry)
+    recovered_entry["last_status"] = "ok"
+    recovered_entry["last_status_at"] = "2026-07-07T00:01:00Z"
+    recovered_entry["last_error_reset_at"] = None
+    pool_data["test-provider"] = [recovered_entry]
+    auth_json.write_text(json.dumps({"credential_pool": pool_data}), encoding="utf-8")
+    assert models.process_wakeup_credential_state_fingerprint(session) == paused_fingerprint
+
+    captured = {}
+
+    def _fake_start_run(s, **kwargs):
+        captured["source"] = kwargs.get("source")
+        captured["model"] = kwargs.get("model")
+        captured["model_provider"] = kwargs.get("model_provider")
+        return {"stream_id": "stream-status-recovered", "session_id": s.session_id, "_status": 200}
+
+    monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda _s, _w: str(tmp_path))
+    monkeypatch.setattr(routes, "_read_profile_model_config", lambda _s, _p: (None, None, {}))
+    monkeypatch.setattr(
+        routes,
+        "_resolve_compatible_session_model_state",
+        lambda *_args, **_kwargs: ("test-model", "test-provider", False),
+    )
+    monkeypatch.setattr(routes, "_start_run", _fake_start_run)
+
+    response = routes.start_session_turn(
+        session.session_id,
+        "[IMPORTANT: Background process completed after status recovery.]",
+        source="process_wakeup",
+    )
+
+    assert response["_status"] == 200
+    assert response["stream_id"] == "stream-status-recovered"
+    assert captured == {
+        "source": "process_wakeup",
+        "model": "test-model",
+        "model_provider": "test-provider",
+    }
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert saved.process_wakeup_pause == {}
 
 
 def test_process_wakeup_pause_suppresses_at_provider_model_session(tmp_path, monkeypatch):
