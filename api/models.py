@@ -3118,18 +3118,47 @@ def _cached_session_lags_disk(cached) -> bool:
     if disk_count is not None:
         if disk_count > cached_count:
             return True
-        # Disk is at most as far as cache; for inactive sessions we don't
-        # need to compare anchor-scene records (those are only updated by
-        # active streaming/recovery paths, which we can detect cheaply below).
+        # Disk is at most as far as cache. Even when counts match, anchor scene
+        # records can advance independently (api/routes.py saves a session
+        # with `s.save(touch_updated_at=False, skip_index=True)` after editing
+        # only the scene dict; message_count is len(messages) so it stays the
+        # same). Greptile flagged this in PR review. Cheaply check the disk's
+        # scene records from the same prefix we already read.
+        cached_scenes = getattr(cached, 'anchor_activity_scenes', None) or {}
+        if not isinstance(cached_scenes, dict):
+            cached_scenes = {}
+        if cached_scenes:
+            disk_meta_quick = _persisted_session_meta_prefix(sid)
+            if disk_meta_quick is not None:
+                disk_scenes = disk_meta_quick.get('anchor_activity_scenes') or {}
+                if not isinstance(disk_scenes, dict):
+                    disk_scenes = {}
+                if not disk_scenes or set(disk_scenes.keys()) != set(cached_scenes.keys()):
+                    # Scene key set differs — disk has been updated with new
+                    # keys the cache hasn't seen.
+                    return True
+                # Same key set: check the latest updated_at timestamp.
+                def _max_updated(records):
+                    latest = 0.0
+                    for record in records.values():
+                        if not isinstance(record, dict):
+                            continue
+                        try:
+                            ua = float(record.get('updated_at') or 0)
+                        except (TypeError, ValueError):
+                            ua = 0.0
+                        if ua > latest:
+                            latest = ua
+                    return latest
+                if _max_updated(disk_scenes) > _max_updated(cached_scenes):
+                    return True
         if getattr(cached, 'active_stream_id', None) or getattr(cached, 'pending_user_message', None):
-            # Active session: anchor-scene keys may have advanced even when
-            # the count is the same. Fall through to the full check.
+            # Active session: messages may be in flight; fall through to the
+            # full check to be safe.
             pass
         else:
-            # Inactive session, count matches → cache is at parity with disk.
-            # The pre-fix code would still load_metadata_only to compare
-            # anchor scenes, but for inactive sessions those cannot have
-            # advanced without the count advancing too. Skip the full load.
+            # Inactive session, count matches, scene records match — cache is
+            # at parity with disk.
             return False
     try:
         disk_meta = Session.load_metadata_only(sid)
@@ -3181,6 +3210,29 @@ def _persisted_message_count(sid) -> int | None:
         # Fall through to the index-based fallback below.
         pass
     return _parse_nonnegative_int(_lookup_index_message_count(sid))
+
+
+def _persisted_session_meta_prefix(sid) -> dict | None:
+    """Return the parsed metadata prefix dict for *sid*, or None on error.
+
+    Used by ``_cached_session_lags_disk`` to compare additional fields (e.g.
+    anchor scene records) cheaply against the cached in-memory session without
+    paying for a full ``Session.load_metadata_only`` parse. Returns the same
+    shape as ``_persisted_message_count`` callers would expect — a dict that
+    only contains the metadata-prefix fields, NOT ``messages`` / ``tool_calls``.
+    """
+    if not is_safe_session_id(sid):
+        return None
+    p = SESSION_DIR / f'{sid}.json'
+    if not p.exists():
+        return None
+    try:
+        prefix = _read_metadata_json_prefix(p)
+        if not prefix:
+            return None
+        return json.loads(prefix)
+    except Exception:
+        return None
 
 
 def _session_is_evictable(s) -> bool:
