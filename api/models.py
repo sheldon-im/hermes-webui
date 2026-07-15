@@ -5256,13 +5256,16 @@ def _read_state_db_sidebar_overrides(
             has_messages_table = cur.fetchone() is not None
             messages_has_session_id = False
             messages_has_timestamp = False
+            messages_has_title_fields = False
             if has_messages_table:
                 cur.execute("PRAGMA table_info(messages)")
                 message_cols = {str(row[1]) for row in cur.fetchall()}
                 messages_has_session_id = 'session_id' in message_cols
                 messages_has_timestamp = 'timestamp' in message_cols
+                messages_has_title_fields = {'session_id', 'role', 'content', 'timestamp'}.issubset(message_cols)
 
             overrides: dict[str, dict] = {}
+            delegated_title_ids: set[str] = set()
             ids = list(wanted)
             chunk_size = 500
             for i in range(0, len(ids), chunk_size):
@@ -5283,6 +5286,12 @@ def _read_state_db_sidebar_overrides(
                     if state_title:
                         entry['_state_db_title'] = state_title
                     state_source = str(row['source'] or '').strip().lower()
+                    if (
+                        state_source == 'subagent'
+                        and sid in count_wanted
+                        and ' '.join(state_title.split()) == 'Subagent Session'
+                    ):
+                        delegated_title_ids.add(sid)
                     if state_source:
                         entry['_state_db_source'] = state_source
                         source_meta = normalize_agent_session_source(state_source)
@@ -5327,6 +5336,29 @@ def _read_state_db_sidebar_overrides(
                                 entry['_state_db_last_message_at'] = float(row['last_message_at'] or 0)
                             except (TypeError, ValueError):
                                 pass
+            if messages_has_title_fields and delegated_title_ids:
+                seen_user_messages: set[str] = set()
+                delegated_title_ids = list(delegated_title_ids)
+                for i in range(0, len(delegated_title_ids), chunk_size):
+                    chunk = delegated_title_ids[i:i + chunk_size]
+                    placeholders = ','.join('?' * len(chunk))
+                    cur.execute(
+                        f"""
+                        SELECT session_id, role, content, timestamp
+                        FROM messages
+                        WHERE session_id IN ({placeholders}) AND role = 'user'
+                        ORDER BY session_id, timestamp ASC
+                        """,
+                        chunk,
+                    )
+                    for row in cur.fetchall():
+                        sid = str(row['session_id'])
+                        if sid in seen_user_messages:
+                            continue
+                        display_title = title_from([dict(row)], fallback='')
+                        if display_title:
+                            seen_user_messages.add(sid)
+                            overrides.setdefault(sid, {})['_state_db_display_title'] = display_title
             return overrides
     except Exception:
         return {}
@@ -5381,6 +5413,7 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
         state_db_source_label = entry.pop('_state_db_source_label', None)
         state_db_message_count = entry.pop('_state_db_message_count', None)
         state_db_last_message_at = entry.pop('_state_db_last_message_at', None)
+        state_db_display_title = entry.pop('_state_db_display_title', None)
         if state_db_source == 'webui':
             session['source_tag'] = state_db_source_tag
             session['raw_source'] = state_db_raw_source
@@ -5440,6 +5473,12 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
         ):
             session['_state_db_title'] = state_db_title
             session['display_title'] = state_db_title
+        if (
+            state_db_display_title
+            and state_db_source == 'subagent'
+            and ' '.join(str(title or '').split()) == 'Subagent Session'
+        ):
+            session['display_title'] = state_db_display_title
 
 
 def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
@@ -5711,6 +5750,8 @@ def title_from(messages, fallback: str='Untitled'):
     for m in messages:
         if m.get('role') == 'user':
             c = m.get('content', '')
+            if c is None:
+                continue
             if isinstance(c, list):
                 c = ' '.join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') == 'text')
             text = _strip_attached_files_marker(str(c))
