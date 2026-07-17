@@ -657,6 +657,46 @@ def test_retry_growth_attaches_later_tool_to_reasoning_segment():
     assert session.tool_calls[0]["assistant_msg_idx"] == reasoning_idx
 
 
+def test_tool_before_reasoning_keeps_own_anchor_on_regrowth():
+    session_id = "issue3929_tool_before_reasoning_regrowth"
+    stream_id = "stream_tool_before_reasoning_regrowth"
+    session = Session(
+        session_id=session_id,
+        title="Tool before reasoning regrowth",
+        messages=[
+            {"role": "user", "content": "Keep checking"},
+            {
+                "role": "assistant",
+                "content": "",
+                "_recovered_from_run_journal": True,
+                "_recovered_stream_id": stream_id,
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning": "Inspect the follow-up boundary.",
+                "_recovered_from_run_journal": True,
+                "_recovered_stream_id": stream_id,
+            },
+        ],
+        context_messages=[{"role": "user", "content": "Keep checking"}],
+    )
+    append_run_event(
+        session_id,
+        stream_id,
+        "tool",
+        {"name": "terminal", "preview": "inspect the first boundary"},
+    )
+
+    assert _append_journaled_partial_output(
+        session, stream_id, dedupe_existing=True,
+    ) is True
+
+    assert session.tool_calls[0]["assistant_msg_idx"] == 1
+    assert session.messages[1].get("reasoning") is None
+    assert session.messages[2].get("reasoning") == "Inspect the follow-up boundary."
+
+
 def test_identical_reasoning_segments_around_tool_remain_distinct():
     session_id = "issue3929_identical_reasoning_segments"
     stream_id = "stream_identical_reasoning_segments"
