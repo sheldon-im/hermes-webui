@@ -505,3 +505,254 @@ def test_visibility_and_settings_refresh_use_current_quota_provider_helper():
     # Settings toggle in panels.js uses _currentQuotaProvider
     toggle_region = _between(panels_js, "showQuotaChipCb.addEventListener('change'", "_schedulePreferencesAutosave();")
     assert "_currentQuotaProvider()" in toggle_region
+
+
+# Multi-window usage-API providers. The status envelopes below mirror what the
+# backend returns for OpenCode Go and Command Code (#7883): several account
+# windows, no dollar quota. The chip shows the most constrained window.
+
+_OPENCODE_GO_STATUS = {
+    "ok": True,
+    "provider": "opencode-go",
+    "display_name": "OpenCode Go",
+    "supported": True,
+    "status": "available",
+    "quota": None,
+    "label": "OpenCode Go limits",
+    "message": "OpenCode Go account limits loaded.",
+    "account_limits": {
+        "provider": "opencode-go",
+        "source": "usage_api",
+        "title": "OpenCode Go limits",
+        "plan": "OpenCode Go",
+        "windows": [
+            {"label": "Rolling", "used_percent": 20.0, "remaining_percent": 80.0,
+             "reset_at": "2026-09-28T09:00:00Z", "detail": None},
+            {"label": "Weekly", "used_percent": 88.0, "remaining_percent": 12.0,
+             "reset_at": "2026-10-01T00:00:00Z", "detail": None},
+            {"label": "Monthly", "used_percent": 45.0, "remaining_percent": 55.0,
+             "reset_at": "2026-10-15T00:00:00Z", "detail": None},
+        ],
+        "details": [],
+        "available": True,
+        "unavailable_reason": None,
+        "fetched_at": None,
+    },
+}
+
+_COMMANDCODE_STATUS = {
+    "ok": True,
+    "provider": "commandcode",
+    "display_name": "Command Code",
+    "supported": True,
+    "status": "available",
+    "quota": None,
+    "label": "Command Code limits",
+    "message": "Command Code account limits loaded.",
+    "account_limits": {
+        "provider": "commandcode",
+        "source": "usage_api",
+        "title": "Command Code limits",
+        "plan": "Command Code",
+        "windows": [
+            {"label": "5-hour", "used_percent": 10.0, "remaining_percent": 90.0,
+             "reset_at": "2026-09-28T09:00:00Z", "detail": "$1 used of $10"},
+            {"label": "Weekly", "used_percent": 70.0, "remaining_percent": 30.0,
+             "reset_at": "2026-10-01T00:00:00Z", "detail": "$35 used of $50"},
+        ],
+        "details": ["Credits remaining: $12.5"],
+        "available": True,
+        "unavailable_reason": None,
+        "fetched_at": None,
+    },
+}
+
+
+def _render_session_provider_status(provider: str, status: dict) -> dict:
+    return _run_quota_scenario(
+        f"""
+S.session = {{session_id: 'sess-1', model_provider: {json.dumps(provider)}}};
+const request = refreshProviderQuotaIndicator(_currentQuotaProvider());
+pending[0].resolve({json.dumps(status)});
+await request;
+return {{requests, finalState: snapshot()}};
+"""
+    )
+
+
+@pytest.mark.parametrize(
+    "provider, status, label, title",
+    [
+        (
+            "opencode-go",
+            _OPENCODE_GO_STATUS,
+            "12%",
+            "OpenCode Go — OpenCode Go account limits loaded. — Weekly: 12% remaining",
+        ),
+        (
+            "commandcode",
+            _COMMANDCODE_STATUS,
+            "30%",
+            "Command Code — Command Code account limits loaded. — Weekly: 30% remaining",
+        ),
+    ],
+)
+def test_usage_api_provider_chip_shows_most_constrained_window(provider, status, label, title):
+    report = _render_session_provider_status(provider, status)
+
+    assert report["requests"] == [f"/api/provider/quota?provider={provider}"]
+    assert report["finalState"]["desktop"] == {"hidden": False, "label": label, "title": title}
+    assert report["finalState"]["mobile"] == {
+        "hidden": False,
+        "display": "",
+        "label": label,
+        "title": title,
+    }
+
+
+def test_most_constrained_window_ignores_windows_without_a_numeric_remaining_share():
+    status = json.loads(json.dumps(_OPENCODE_GO_STATUS))
+    status["account_limits"]["windows"] = [
+        {"label": "Rolling", "remaining_percent": None},
+        {"label": "Weekly", "remaining_percent": "n/a"},
+        {"label": "Blank", "remaining_percent": " "},
+        {"label": "Flag", "remaining_percent": False},
+        {"label": "Monthly", "remaining_percent": 55.0},
+    ]
+
+    report = _render_session_provider_status("opencode-go", status)
+
+    assert report["finalState"]["desktop"]["label"] == "55%"
+    assert report["finalState"]["desktop"]["title"].endswith("Monthly: 55% remaining")
+
+
+def test_windows_without_any_numeric_remaining_share_hide_the_chip():
+    status = json.loads(json.dumps(_COMMANDCODE_STATUS))
+    status["account_limits"]["windows"] = [{"label": "5-hour", "remaining_percent": None}]
+
+    report = _render_session_provider_status("commandcode", status)
+
+    assert report["finalState"]["desktop"] == {"hidden": True, "label": "", "title": ""}
+    assert report["finalState"]["mobile"]["hidden"] is True
+
+
+def test_unlabelled_single_window_keeps_the_existing_title_format():
+    report = _run_quota_scenario(
+        """
+const request = refreshProviderQuotaIndicator('openai-codex');
+pending[0].resolve({
+  status: 'available',
+  provider: 'openai-codex',
+  display_name: 'OpenAI Codex',
+  message: 'Account usage loaded',
+  account_limits: {windows: [{remaining_percent: 42}]},
+});
+await request;
+return snapshot();
+"""
+    )
+
+    assert report["desktop"] == {
+        "hidden": False,
+        "label": "42%",
+        "title": "OpenAI Codex — Account usage loaded — 42% remaining",
+    }
+
+
+def test_codex_multi_window_chip_now_shows_the_weekly_limit_when_it_is_lower():
+    """Existing multi-window providers follow the same rule: Codex reports Session
+    then Weekly, and the chip shows whichever has less remaining."""
+    report = _run_quota_scenario(
+        """
+const request = refreshProviderQuotaIndicator('openai-codex');
+pending[0].resolve({
+  status: 'available',
+  provider: 'openai-codex',
+  display_name: 'OpenAI Codex',
+  message: 'Account usage loaded',
+  account_limits: {windows: [
+    {label: 'Session', remaining_percent: 85},
+    {label: 'Weekly', remaining_percent: 60},
+  ]},
+});
+await request;
+return snapshot();
+"""
+    )
+
+    assert report["desktop"] == {
+        "hidden": False,
+        "label": "60%",
+        "title": "OpenAI Codex — Account usage loaded — Weekly: 60% remaining",
+    }
+    assert report["mobile"]["label"] == "60%"
+
+
+@pytest.mark.parametrize("missing", [None, "", False])
+def test_missing_dollar_quota_hides_instead_of_showing_zero(missing):
+    """A missing or backend-rejected measurement arrives as null; Number(null) is 0,
+    which used to render as a false $0.00 remaining."""
+    report = _run_quota_scenario(
+        f"""
+const request = refreshProviderQuotaIndicator('openrouter');
+pending[0].resolve({{
+  status: 'available',
+  provider: 'openrouter',
+  display_name: 'OpenRouter',
+  quota: {{limit_remaining: {json.dumps(missing)}, usage: 3.5, limit: 10}},
+  account_limits: null,
+}});
+await request;
+return snapshot();
+"""
+    )
+
+    assert report["desktop"] == {"hidden": True, "label": "", "title": ""}
+    assert report["mobile"]["hidden"] is True
+
+
+def test_missing_dollar_usage_is_left_out_of_the_title():
+    report = _run_quota_scenario(
+        """
+const request = refreshProviderQuotaIndicator('openrouter');
+pending[0].resolve({
+  status: 'available',
+  provider: 'openrouter',
+  display_name: 'OpenRouter',
+  message: 'OpenRouter quota loaded',
+  quota: {limit_remaining: 6.5, usage: null, limit: 10},
+  account_limits: null,
+});
+await request;
+return snapshot();
+"""
+    )
+
+    assert report["desktop"] == {
+        "hidden": False,
+        "label": "$6.50",
+        "title": "OpenRouter — OpenRouter quota loaded — limit $10.0",
+    }
+
+
+def test_null_window_does_not_mask_a_later_valid_window():
+    report = _run_quota_scenario(
+        """
+const request = refreshProviderQuotaIndicator('openai-codex');
+pending[0].resolve({
+  status: 'available',
+  provider: 'openai-codex',
+  display_name: 'OpenAI Codex',
+  message: 'Account usage loaded',
+  account_limits: {windows: [
+    {label: 'Session', remaining_percent: null},
+    {label: 'Weekly', remaining_percent: 64},
+  ]},
+});
+await request;
+return snapshot();
+"""
+    )
+
+    assert report["desktop"]["label"] == "64%"
+    assert report["desktop"]["title"].endswith("Weekly: 64% remaining")
